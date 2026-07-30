@@ -10,6 +10,7 @@ A production-ready full-stack web application for intelligent food inventory man
 - **Smart Notifications**: Real-time alerts for expiring foods and expired items
 - **Food Images**: Upload and display food item images
 - **Barcode Scanning**: Support for barcode input and management
+- **Package Label OCR**: Extract expiry dates from label photos with OpenCV + Tesseract
 - **Advanced Search**: Search items by name or barcode
 - **Filtering & Sorting**: Filter by category and status, sort by expiry date
 
@@ -39,6 +40,7 @@ A production-ready full-stack web application for intelligent food inventory man
 - **ORM**: SQLAlchemy
 - **Validation**: Pydantic
 - **Server**: Uvicorn
+- **OCR**: OpenCV + Tesseract
 
 ### Frontend
 - **Framework**: React 18+
@@ -84,6 +86,7 @@ frise/
 - Python 3.9+
 - Node.js 16+ and npm
 - Git
+- Tesseract OCR installed on your machine and available on `PATH`
 
 ### Backend Setup
 
@@ -143,6 +146,7 @@ The frontend will be available at `http://localhost:3000`
 - `PUT /api/food-items/{id}` - Update a food item
 - `DELETE /api/food-items/{id}` - Delete a food item
 - `POST /api/food-items/{id}/upload-image` - Upload item image
+- `POST /api/ocr/expiry-date` - Scan a package label image and extract an expiry date
 
 ### Search & Filter
 - `GET /api/search?query=` - Search by name or barcode

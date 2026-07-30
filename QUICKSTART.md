@@ -22,6 +22,8 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Make sure Tesseract OCR is installed on the system and on PATH
+
 # Run the server (http://localhost:8000)
 python main.py
 
@@ -135,6 +137,7 @@ GET    /api/food-items/{id}         # Get specific item
 PUT    /api/food-items/{id}         # Update item
 DELETE /api/food-items/{id}         # Delete item
 POST   /api/food-items/{id}/upload-image  # Upload image
+POST   /api/ocr/expiry-date               # OCR expiry date from label image
 
 # Search & Filter
 GET    /api/search?query=<text>    # Search items

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
+import aiohttp
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +25,7 @@ import schemas
 from database import get_db, init_db
 
 FRIDGE_CAPACITY_UNITS = 40
+EXPIRY_ALERT_WINDOW_HOURS = 24
 SHELF_CAPACITY_UNITS = {
     "Top Shelf": 8,
     "Middle Shelf": 8,
@@ -86,7 +88,7 @@ def calculate_status(expiry_date: datetime) -> StatusEnum:
 
     if time_diff.total_seconds() < 0:
         return StatusEnum.EXPIRED
-    elif time_diff.total_seconds() < 48 * 3600:  # 48 hours
+    elif time_diff.total_seconds() <= EXPIRY_ALERT_WINDOW_HOURS * 3600:
         return StatusEnum.EXPIRING_SOON
     else:
         return StatusEnum.FRESH
@@ -147,6 +149,32 @@ def ensure_status_notification(
     ))
 
 
+def prune_non_expiring_notifications(db: Session) -> bool:
+    """Remove expiry alerts whose item's current status no longer matches."""
+    active_status_by_item_id = {
+        item.id: item.status
+        for item in db.query(FoodItem).all()
+    }
+    notification_statuses = {
+        NotificationTypeEnum.EXPIRING_SOON: StatusEnum.EXPIRING_SOON,
+        NotificationTypeEnum.EXPIRED: StatusEnum.EXPIRED,
+    }
+    notifications = db.query(Notification).filter(
+        Notification.notification_type.in_(notification_statuses.keys())
+    ).all()
+
+    stale_notifications = [
+        notification
+        for notification in notifications
+        if active_status_by_item_id.get(notification.item_id)
+        != notification_statuses[notification.notification_type]
+    ]
+    for notification in stale_notifications:
+        db.delete(notification)
+
+    return bool(stale_notifications)
+
+
 def sync_item_statuses_and_notifications(db: Session) -> None:
     """Refresh item statuses and generate expiry notifications."""
     changed = False
@@ -164,8 +192,371 @@ def sync_item_statuses_and_notifications(db: Session) -> None:
             ensure_status_notification(db, item, status)
             changed = changed or len(db.new) > before_new
 
+    changed = prune_non_expiring_notifications(db) or changed
+
     if changed:
         db.commit()
+
+
+def first_text_value(*values: Optional[str]) -> Optional[str]:
+    """Return the first non-empty text value."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _load_ocr_dependencies():
+    """Load OCR libraries lazily so the app can still boot without them."""
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+        import pytesseract  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependency availability
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "OCR dependencies are not installed. Install "
+                "opencv-python-headless and pytesseract, and make sure the "
+                "Tesseract binary is available on the server."
+            )
+        ) from exc
+
+    return cv2, np, pytesseract
+
+
+def preprocess_ocr_image(image_bytes: bytes):
+    """Create OCR-friendly image variants from an uploaded label photo."""
+    cv2, np, _ = _load_ocr_dependencies()
+
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Could not read the image")
+
+    height, width = image.shape[:2]
+    if width and width < 1200:
+        scale = 1200 / width
+        image = cv2.resize(
+            image,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+    grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    grayscale = cv2.bilateralFilter(grayscale, 9, 75, 75)
+    grayscale = cv2.convertScaleAbs(grayscale, alpha=1.5, beta=0)
+
+    threshold = cv2.adaptiveThreshold(
+        grayscale,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+    inverted_threshold = cv2.bitwise_not(threshold)
+    sharpened = cv2.GaussianBlur(grayscale, (0, 0), 3)
+    sharpened = cv2.addWeighted(grayscale, 1.6, sharpened, -0.6, 0)
+
+    return [grayscale, threshold, inverted_threshold, sharpened]
+
+
+def _clean_ocr_text(text: str) -> str:
+    """Normalize OCR text for date extraction."""
+    return re.sub(r"[ \t]+", " ", (text or "").replace("\r", "\n")).strip()
+
+
+def _safe_normalize_year(year_text: str) -> int:
+    """Convert two-digit years into four digits."""
+    year = int(year_text)
+    if len(year_text) == 2:
+        year += 2000
+    return year
+
+
+def _is_valid_date(day: int, month_index: int, year: int) -> bool:
+    """Check whether a date component set is valid."""
+    try:
+        datetime(year, month_index + 1, day)
+    except ValueError:
+        return False
+    return 2020 <= year <= 2100
+
+
+def _score_context(context: str) -> int:
+    """Score label text around a date candidate."""
+    lower = context.lower()
+    score = 0
+
+    for keyword in [
+        "best before",
+        "bestby",
+        "best-by",
+        "use by",
+        "use-by",
+        "expiry",
+        "exp",
+        "expires",
+        "expire",
+        "sell by",
+        "sell-by",
+        "bb",
+        "bb/",
+        "bb:",
+    ]:
+        if keyword in lower:
+            score += 5
+
+    for keyword in [
+        "mfg",
+        "manufactured",
+        "production",
+        "packed",
+        "batch",
+        "lot",
+    ]:
+        if keyword in lower:
+            score -= 3
+
+    return score
+
+
+def extract_expiry_candidates(text: str) -> List[Dict]:
+    """Extract likely expiry dates from OCR text."""
+    cleaned_text = _clean_ocr_text(text)
+    candidates = []
+    current_year = datetime.now().year
+    now = datetime.now()
+
+    def add_candidate(match_text: str, candidate_date: datetime, context: str):
+        score = _score_context(context)
+        if candidate_date >= now:
+            score += 2
+        else:
+            score -= 1
+
+        if candidate_date.year >= current_year:
+            score += 1
+
+        candidates.append({
+            "text": match_text,
+            "date": candidate_date,
+            "score": score,
+            "context": context.strip(),
+        })
+
+    iso_pattern = re.compile(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b")
+    numeric_pattern = re.compile(r"\b(\d{1,2})[./\-\s](\d{1,2})[./\-\s](\d{2,4})\b")
+    month_lookup = {
+        "jan": 0,
+        "january": 0,
+        "feb": 1,
+        "february": 1,
+        "mar": 2,
+        "march": 2,
+        "apr": 3,
+        "april": 3,
+        "may": 4,
+        "jun": 5,
+        "june": 5,
+        "jul": 6,
+        "july": 6,
+        "aug": 7,
+        "august": 7,
+        "sep": 8,
+        "sept": 8,
+        "september": 8,
+        "oct": 9,
+        "october": 9,
+        "nov": 10,
+        "november": 10,
+        "dec": 11,
+        "december": 11,
+    }
+    month_pattern = re.compile(
+        r"\b(\d{1,2})\s*"
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|"
+        r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        r"(?:\s+(\d{2,4}))?\b",
+        re.IGNORECASE
+    )
+    reverse_month_pattern = re.compile(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|"
+        r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+"
+        r"(\d{1,2})(?:,?\s+(\d{2,4}))?\b",
+        re.IGNORECASE
+    )
+
+    for match in iso_pattern.finditer(cleaned_text):
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        if _is_valid_date(day, month - 1, year):
+            context = cleaned_text[max(0, match.start() - 30): match.end() + 30]
+            add_candidate(match.group(0), datetime(year, month, day), context)
+
+    for match in numeric_pattern.finditer(cleaned_text):
+        first = int(match.group(1))
+        second = int(match.group(2))
+        year = _safe_normalize_year(match.group(3))
+        context = cleaned_text[max(0, match.start() - 30): match.end() + 30]
+
+        if len(match.group(1)) == 4 and _is_valid_date(int(match.group(3)), second - 1, first):
+            add_candidate(match.group(0), datetime(first, second, int(match.group(3))), context)
+            continue
+
+        if _is_valid_date(first, second - 1, year):
+            add_candidate(match.group(0), datetime(year, second, first), context)
+
+        if first <= 12 and second <= 12 and _is_valid_date(second, first - 1, year):
+            add_candidate(match.group(0), datetime(year, first, second), context)
+
+    for match in month_pattern.finditer(cleaned_text):
+        day = int(match.group(1))
+        month_name = match.group(2).lower()
+        year = _safe_normalize_year(match.group(3)) if match.group(3) else current_year
+        month = month_lookup.get(month_name[:3])
+        if month is None or not _is_valid_date(day, month, year):
+            continue
+        context = cleaned_text[max(0, match.start() - 30): match.end() + 30]
+        add_candidate(match.group(0), datetime(year, month + 1, day), context)
+
+    for match in reverse_month_pattern.finditer(cleaned_text):
+        month_name = match.group(1).lower()
+        day = int(match.group(2))
+        year = _safe_normalize_year(match.group(3)) if match.group(3) else current_year
+        month = month_lookup.get(month_name[:3])
+        if month is None or not _is_valid_date(day, month, year):
+            continue
+        context = cleaned_text[max(0, match.start() - 30): match.end() + 30]
+        add_candidate(match.group(0), datetime(year, month + 1, day), context)
+
+    candidates.sort(
+        key=lambda item: (
+            item["score"],
+            1 if item["date"] >= now else 0,
+            item["date"],
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def extract_expiry_date_from_text(text: str) -> Optional[datetime]:
+    """Pick the most likely expiry date from OCR text."""
+    candidates = extract_expiry_candidates(text)
+    if not candidates:
+        return None
+
+    positive_context = [candidate for candidate in candidates if candidate["score"] >= 5]
+    pool = positive_context or candidates
+    future_candidates = [candidate for candidate in pool if candidate["date"] >= datetime.now()]
+    selected = future_candidates[0] if future_candidates else pool[0]
+    return selected["date"]
+
+
+def ocr_label_image(image_bytes: bytes) -> Dict:
+    """Run OpenCV preprocessing and Tesseract OCR on a package label image."""
+    _, _, pytesseract = _load_ocr_dependencies()
+    image_variants = preprocess_ocr_image(image_bytes)
+    best_text = ""
+    best_candidates = []
+
+    for variant in image_variants:
+        for psm in (6, 11, 12):
+            config = f"--oem 3 --psm {psm}"
+            text = pytesseract.image_to_string(variant, config=config)
+            cleaned_text = _clean_ocr_text(text)
+            if len(cleaned_text) > len(best_text):
+                best_text = cleaned_text
+
+            candidate_date = extract_expiry_date_from_text(cleaned_text)
+            if candidate_date:
+                best_candidates = extract_expiry_candidates(cleaned_text)
+                break
+        if best_candidates:
+            break
+
+    selected_date = extract_expiry_date_from_text(best_text)
+    if not selected_date and best_candidates:
+        selected_date = best_candidates[0]["date"]
+
+    return {
+        "found": selected_date is not None,
+        "expiry_date": selected_date.isoformat() if selected_date else None,
+        "raw_text": best_text,
+        "candidates": [
+            {
+                "text": candidate["text"],
+                "expiry_date": candidate["date"].isoformat(),
+                "score": candidate["score"],
+                "context": candidate["context"],
+            }
+            for candidate in best_candidates[:5]
+        ],
+    }
+
+
+def map_product_category(product: Dict) -> str:
+    """Map product metadata into the app's category list."""
+    category_text = " ".join([
+        str(product.get("categories") or ""),
+        str(product.get("categories_tags") or ""),
+        str(product.get("pnns_groups_1") or ""),
+        str(product.get("pnns_groups_2") or ""),
+    ]).lower()
+
+    category_keywords = [
+        ("Dairy", ["dairy", "milk", "cheese", "yogurt", "butter"]),
+        ("Meat", ["meat", "fish", "poultry", "seafood", "ham", "sausage"]),
+        ("Fruits", ["fruit", "fruits"]),
+        ("Vegetables", ["vegetable", "vegetables"]),
+        ("Beverages", ["beverage", "drink", "juice", "soda"]),
+        ("Snacks", ["snack", "chips", "biscuits", "cookies", "sweet"]),
+        ("Frozen", ["frozen"]),
+        ("Grains", ["cereal", "grain", "rice", "pasta", "bread"]),
+        ("Pantry", ["sauce", "condiment", "oil", "spice", "canned"]),
+    ]
+
+    for category, keywords in category_keywords:
+        if any(keyword in category_text for keyword in keywords):
+            return category
+
+    return "Other"
+
+
+def build_product_payload(barcode: str, product: Dict) -> Dict:
+    """Shape Open Food Facts data for the item form."""
+    item_name = first_text_value(
+        product.get("product_name"),
+        product.get("product_name_en"),
+        product.get("generic_name"),
+        product.get("generic_name_en"),
+        product.get("abbreviated_product_name"),
+    )
+    quantity_text = first_text_value(product.get("quantity"))
+
+    return {
+        "barcode": barcode,
+        "found": bool(item_name),
+        "item_name": item_name,
+        "category": map_product_category(product),
+        "description": first_text_value(
+            product.get("brands"),
+            product.get("categories")
+        ),
+        "quantity_text": quantity_text,
+        "image_url": first_text_value(
+            product.get("image_front_url"),
+            product.get("image_url")
+        ),
+        "source": "Open Food Facts",
+    }
 
 
 def get_used_space(db: Session, exclude_item_id: Optional[int] = None) -> int:
@@ -539,6 +930,7 @@ async def update_food_item(
     db.refresh(db_item)
 
     ensure_status_notification(db, db_item, db_item.status)
+    prune_non_expiring_notifications(db)
 
     # Log activity
     log = ActivityLog(
@@ -648,6 +1040,28 @@ async def upload_image(
     }
 
 
+@app.post("/api/ocr/expiry-date")
+async def extract_expiry_date(
+    file: UploadFile = File(...),
+):
+    """Extract an expiry date from a package label image."""
+    allowed_types = [
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/jpg",
+    ]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image upload")
+
+    result = ocr_label_image(image_bytes)
+    return result
+
+
 # ==================== Search Endpoint ====================
 
 @app.get("/api/search")
@@ -665,6 +1079,63 @@ async def search_items(
     ).limit(10).all()
 
     return items
+
+
+@app.get("/api/barcode/{barcode}")
+async def lookup_barcode(barcode: str):
+    """Look up a barcode and return product details for form autofill."""
+    normalized_barcode = re.sub(r"\D+", "", barcode or "")
+    if len(normalized_barcode) < 4:
+        raise HTTPException(status_code=400, detail="Enter a valid barcode")
+
+    url = (
+        "https://world.openfoodfacts.org/api/v2/product/"
+        f"{normalized_barcode}.json"
+    )
+    fields = ",".join([
+        "code",
+        "product_name",
+        "product_name_en",
+        "generic_name",
+        "generic_name_en",
+        "abbreviated_product_name",
+        "brands",
+        "categories",
+        "categories_tags",
+        "pnns_groups_1",
+        "pnns_groups_2",
+        "quantity",
+        "image_front_url",
+        "image_url",
+    ])
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                params={"fields": fields},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status >= 500:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Barcode lookup service is unavailable"
+                    )
+                data = await response.json()
+    except aiohttp.ClientError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach barcode lookup service"
+        ) from exc
+
+    if data.get("status") != 1 or not data.get("product"):
+        return {
+            "barcode": normalized_barcode,
+            "found": False,
+            "source": "Open Food Facts",
+        }
+
+    return build_product_payload(normalized_barcode, data["product"])
 
 
 # ==================== Dashboard Endpoints ====================
@@ -685,8 +1156,15 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         FoodItem.status == StatusEnum.EXPIRED
     ).count()
 
-    total_notifications = db.query(Notification).count()
+    expiry_notification_types = [
+        NotificationTypeEnum.EXPIRING_SOON,
+        NotificationTypeEnum.EXPIRED,
+    ]
+    total_notifications = db.query(Notification).filter(
+        Notification.notification_type.in_(expiry_notification_types)
+    ).count()
     unread_notifications = db.query(Notification).filter(
+        Notification.notification_type.in_(expiry_notification_types),
         Notification.is_read.is_(False)
     ).count()
     used_space = get_used_space(db)
@@ -764,7 +1242,12 @@ async def get_notifications(
     """Get notifications."""
     sync_item_statuses_and_notifications(db)
 
-    query = db.query(Notification)
+    query = db.query(Notification).filter(
+        Notification.notification_type.in_([
+            NotificationTypeEnum.EXPIRING_SOON,
+            NotificationTypeEnum.EXPIRED,
+        ])
+    )
 
     if unread_only:
         query = query.filter(Notification.is_read.is_(False))

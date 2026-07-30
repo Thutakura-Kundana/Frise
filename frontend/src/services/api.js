@@ -18,6 +18,14 @@ export const foodItemsAPI = {
   delete: (id) => apiClient.delete(`/api/food-items/${id}`),
   consume: (id) => apiClient.post(`/api/food-items/${id}/consume`),
   waste: (id) => apiClient.post(`/api/food-items/${id}/waste`),
+  lookupBarcode: (barcode) => apiClient.get(`/api/barcode/${barcode}`),
+  scanExpiryDate: (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiClient.post('/api/ocr/expiry-date', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
   uploadImage: (id, file) => {
     const formData = new FormData();
     formData.append('file', file);

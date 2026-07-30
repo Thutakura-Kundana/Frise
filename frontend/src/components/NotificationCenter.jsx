@@ -3,20 +3,15 @@ import { FiAlertCircle, FiCheckCircle, FiTrash2 } from 'react-icons/fi';
 import '../styles/NotificationCenter.css';
 
 const NotificationCenter = ({ notifications, onMarkRead, onDelete }) => {
-  const [filter, setFilter] = useState('all'); // all, unread, expiring, expired
+  const [filter, setFilter] = useState('all');
 
   const filteredNotifications = notifications.filter(notif => {
     if (filter === 'all') return true;
     if (filter === 'unread') return !notif.is_read;
-    if (filter === 'expiring') return notif.notification_type === 'expiring_soon';
-    if (filter === 'expired') return notif.notification_type === 'expired';
     return true;
   });
 
-  const getNotificationIcon = (type) => {
-    if (type === 'expired') {
-      return <FiAlertCircle className="icon icon-expired" />;
-    }
+  const getNotificationIcon = () => {
     return <FiAlertCircle className="icon icon-expiring" />;
   };
 
@@ -37,18 +32,6 @@ const NotificationCenter = ({ notifications, onMarkRead, onDelete }) => {
           >
             Unread
           </button>
-          <button 
-            className={`filter-btn ${filter === 'expiring' ? 'active' : ''}`}
-            onClick={() => setFilter('expiring')}
-          >
-            Expiring Soon
-          </button>
-          <button 
-            className={`filter-btn ${filter === 'expired' ? 'active' : ''}`}
-            onClick={() => setFilter('expired')}
-          >
-            Expired
-          </button>
         </div>
       </div>
 
@@ -65,7 +48,7 @@ const NotificationCenter = ({ notifications, onMarkRead, onDelete }) => {
               className={`notification-item ${notif.is_read ? 'read' : 'unread'} ${notif.notification_type}`}
             >
               <div className="notif-icon">
-                {getNotificationIcon(notif.notification_type)}
+                {getNotificationIcon()}
               </div>
               
               <div className="notif-content">
