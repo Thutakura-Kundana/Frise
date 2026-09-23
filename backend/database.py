@@ -30,6 +30,7 @@ def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
     ensure_food_item_columns()
+    ensure_user_columns()
 
 
 def ensure_food_item_columns():
@@ -56,4 +57,23 @@ def ensure_food_item_columns():
     with engine.begin() as connection:
         for column_name, statement in migrations.items():
             if column_name not in existing_columns:
+                connection.execute(text(statement))
+
+
+def ensure_user_columns():
+    """Add ownership columns to databases created before authentication."""
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        table_columns = {
+            table: {column["name"] for column in inspector.get_columns(table)}
+            for table in ("food_items", "notifications", "activity_logs")
+            if table in inspector.get_table_names()
+        }
+        migrations = {
+            "food_items": "ALTER TABLE food_items ADD COLUMN user_id INTEGER",
+            "notifications": "ALTER TABLE notifications ADD COLUMN user_id INTEGER",
+            "activity_logs": "ALTER TABLE activity_logs ADD COLUMN user_id INTEGER",
+        }
+        for table, statement in migrations.items():
+            if table in table_columns and "user_id" not in table_columns[table]:
                 connection.execute(text(statement))

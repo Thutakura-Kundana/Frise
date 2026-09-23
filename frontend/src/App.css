@@ -121,6 +121,20 @@ body {
   color: #128c7e;
 }
 
+.account-control {
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.account-control:hover { background: #f0fdf4; border-color: #25d366; }
+
 .alert-setup-bar {
   min-height: 52px;
   padding: 10px 30px;

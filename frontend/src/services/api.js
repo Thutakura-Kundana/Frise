@@ -9,6 +9,19 @@ const apiClient = axios.create({
   },
 });
 
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem('frise_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+export const authAPI = {
+  register: (data) => apiClient.post('/api/auth/register', data),
+  login: (data) => apiClient.post('/api/auth/login', data),
+  me: () => apiClient.get('/api/auth/me'),
+  updateFridge: (fridge_capacity) => apiClient.put('/api/settings/fridge', { fridge_capacity }),
+};
+
 // Food Items API
 export const foodItemsAPI = {
   create: (data) => apiClient.post('/api/food-items', data),
@@ -23,6 +36,13 @@ export const foodItemsAPI = {
     const formData = new FormData();
     formData.append('file', file);
     return apiClient.post('/api/ocr/expiry-date', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
+  scanBarcodeNumber: (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiClient.post('/api/ocr/barcode', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
   },

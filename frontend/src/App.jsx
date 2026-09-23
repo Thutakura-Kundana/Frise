@@ -9,8 +9,9 @@ import Inventory from './components/Inventory';
 import Analytics from './components/Analytics';
 import NotificationCenter from './components/NotificationCenter';
 import FoodModal from './components/FoodModal';
+import AuthScreen from './components/AuthScreen';
 
-import { foodItemsAPI, dashboardAPI, notificationsAPI } from './services/api';
+import { authAPI, foodItemsAPI, dashboardAPI, notificationsAPI } from './services/api';
 
 import './App.css';
 
@@ -300,6 +301,7 @@ function AppContent({
 }
 
 function App() {
+  const [user, setUser] = useState(null);
   const [items, setItems] = useState([]);
   const [stats, setStats] = useState(null);
   const [notifications, setNotifications] = useState([]);
@@ -315,12 +317,45 @@ function App() {
   const audioContextRef = useRef(null);
   const lastReminderAt = useRef(new Map());
 
-  // Fetch data
   useEffect(() => {
+    const token = localStorage.getItem('frise_token');
+    if (!token) {
+      setLoading(false);
+      return undefined;
+    }
+    authAPI.me()
+      .then(response => setUser(response.data))
+      .catch(() => localStorage.removeItem('frise_token'))
+      .finally(() => setLoading(false));
+    return undefined;
+  }, []);
+
+  useEffect(() => {
+    if (!user) return undefined;
     loadData();
     const interval = setInterval(loadData, 30000); // Refresh every 30 seconds
     return () => clearInterval(interval);
-  }, []);
+  }, [user]);
+
+  const handleLogout = () => {
+    localStorage.removeItem('frise_token');
+    setUser(null);
+    setItems([]);
+    setStats(null);
+  };
+
+  const handleCapacityChange = async () => {
+    const value = Number(window.prompt('How many space units can your fridge hold?', user.fridge_capacity));
+    if (!Number.isInteger(value) || value < 1 || value > 1000) return;
+    try {
+      const response = await authAPI.updateFridge(value);
+      setUser(response.data);
+      loadData();
+      toast.success('Fridge capacity updated');
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Could not update fridge capacity');
+    }
+  };
 
   const playAlertSound = async ({ force = false } = {}) => {
     if (!force && !alertsEnabledRef.current) return false;
@@ -657,6 +692,10 @@ function App() {
     }
   };
 
+  if (!user) {
+    return <AuthScreen onAuthenticated={setUser} />;
+  }
+
   return (
     <Router>
       <div className="App">
@@ -676,6 +715,12 @@ function App() {
             >
               {alertsEnabled ? <FiBell size={18} /> : <FiVolume2 size={18} />}
               <span>{alertsEnabled ? 'Alerts On' : 'Enable Alerts'}</span>
+            </button>
+            <button type="button" className="account-control" onClick={handleCapacityChange} title="Change fridge capacity">
+              Fridge: {user.fridge_capacity} units
+            </button>
+            <button type="button" className="account-control" onClick={handleLogout}>
+              Sign out
             </button>
           </div>
         </nav>

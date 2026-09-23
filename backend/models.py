@@ -1,5 +1,5 @@
 """Database models for Frise application."""
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Enum
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Enum, ForeignKey
 from sqlalchemy.sql import func
 import enum
 from backend.database import Base
@@ -19,11 +19,23 @@ class NotificationTypeEnum(str, enum.Enum):
     INFO = "info"
 
 
+class User(Base):
+    """Application user and personal fridge settings."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    fridge_capacity = Column(Integer, nullable=False, default=40)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class FoodItem(Base):
     """Food inventory item model."""
     __tablename__ = "food_items"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     item_name = Column(String(255), nullable=False)
     category = Column(String(100), nullable=False)
     barcode = Column(String(100), nullable=True, unique=True)
@@ -44,6 +56,7 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     item_id = Column(Integer, nullable=False)
     message = Column(String(500), nullable=False)
     notification_type = Column(Enum(NotificationTypeEnum), nullable=False)
@@ -57,6 +70,7 @@ class ActivityLog(Base):
     __tablename__ = "activity_logs"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     action = Column(String(100), nullable=False)
     item_id = Column(Integer, nullable=True)
     details = Column(String(500), nullable=True)

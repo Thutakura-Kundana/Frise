@@ -5,6 +5,41 @@ from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
 
+class AuthRegister(BaseModel):
+    """Registration request."""
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=8, max_length=128)
+    fridge_capacity: int = Field(40, ge=1, le=1000)
+
+
+class AuthLogin(BaseModel):
+    """Login request."""
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class UserResponse(BaseModel):
+    """Safe user profile response."""
+    id: int
+    email: str
+    fridge_capacity: int
+
+    class Config:
+        from_attributes = True
+
+
+class AuthResponse(BaseModel):
+    """Token and user response."""
+    access_token: str
+    token_type: str
+    user: UserResponse
+
+
+class FridgeSettings(BaseModel):
+    """Personal fridge capacity settings."""
+    fridge_capacity: int = Field(..., ge=1, le=1000)
+
+
 class StatusEnum(str, Enum):
     """Status enum for food items."""
     FRESH = "fresh"

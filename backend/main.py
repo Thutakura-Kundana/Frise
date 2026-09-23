@@ -3,12 +3,17 @@ import os
 import re
 import json
 import math
+import hashlib
+import secrets
+import base64
+import hmac
 from datetime import datetime
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
 import aiohttp
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -20,11 +25,15 @@ from backend.models import (
     Notification,
     NotificationTypeEnum,
     StatusEnum,
+    User,
 )
-import schemas
-from database import get_db, init_db
+from backend import schemas
+from backend.database import get_db, init_db
 
 FRIDGE_CAPACITY_UNITS = 40
+JWT_SECRET = os.getenv("FRISE_JWT_SECRET", "change-this-frise-secret")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = 60 * 24 * 7
 EXPIRY_ALERT_WINDOW_HOURS = 24
 SHELF_CAPACITY_UNITS = {
     "Top Shelf": 8,
@@ -77,6 +86,90 @@ app.add_middleware(
 # Create uploads directory if it doesn't exist
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def hash_password(password: str) -> str:
+    """Hash a password with a salted, slow standard-library KDF."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 210000)
+    return f"pbkdf2_sha256$210000${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """Verify a password hash without exposing timing differences."""
+    try:
+        algorithm, rounds, salt_hex, digest_hex = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(rounds)
+        )
+        return secrets.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def create_access_token(user_id: int) -> str:
+    """Create a short-lived signed bearer token."""
+    from datetime import timedelta
+    expires = int((datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)).timestamp())
+    header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b"=")
+    body = base64.urlsafe_b64encode(
+        json.dumps({"sub": str(user_id), "exp": expires}, separators=(",", ":")).encode()
+    ).rstrip(b"=")
+    unsigned = header + b"." + body
+    signature = hmac.new(JWT_SECRET.encode(), unsigned, hashlib.sha256).digest()
+    return (unsigned + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")).decode()
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    """Resolve the authenticated user from the bearer token."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        header, body, encoded_signature = credentials.credentials.split(".")
+        unsigned = f"{header}.{body}".encode()
+        expected = hmac.new(JWT_SECRET.encode(), unsigned, hashlib.sha256).digest()
+        actual = base64.urlsafe_b64decode(encoded_signature + "===")
+        if not hmac.compare_digest(actual, expected):
+            raise ValueError("invalid signature")
+        payload = json.loads(base64.urlsafe_b64decode(body + "===").decode())
+        if int(payload["exp"]) < int(datetime.utcnow().timestamp()):
+            raise ValueError("expired token")
+        user_id = int(payload["sub"])
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return user
+
+
+def user_item_query(db: Session, user: User):
+    """Return the authenticated user's items, including pre-auth legacy rows."""
+    return db.query(FoodItem).filter(
+        (FoodItem.user_id == user.id) | (FoodItem.user_id.is_(None))
+    )
+
+
+def claim_legacy_data(db: Session, user: User) -> None:
+    """Give the first account ownership of data from older Frise versions."""
+    if db.query(User).count() != 1:
+        return
+    db.query(FoodItem).filter(FoodItem.user_id.is_(None)).update(
+        {FoodItem.user_id: user.id}, synchronize_session=False
+    )
+    db.query(Notification).filter(Notification.user_id.is_(None)).update(
+        {Notification.user_id: user.id}, synchronize_session=False
+    )
+    db.query(ActivityLog).filter(ActivityLog.user_id.is_(None)).update(
+        {ActivityLog.user_id: user.id}, synchronize_session=False
+    )
 
 
 # ==================== Utility Functions ====================
@@ -143,23 +236,25 @@ def ensure_status_notification(
 
     db.add(Notification(
         item_id=item.id,
+        user_id=item.user_id,
         message=build_notification_message(item, status),
         notification_type=notification_type,
         triggered_at=datetime.now()
     ))
 
 
-def prune_non_expiring_notifications(db: Session) -> bool:
+def prune_non_expiring_notifications(db: Session, user: Optional[User] = None) -> bool:
     """Remove expiry alerts whose item's current status no longer matches."""
-    active_status_by_item_id = {
-        item.id: item.status
-        for item in db.query(FoodItem).all()
-    }
+    item_query = user_item_query(db, user) if user else db.query(FoodItem)
+    notification_query = db.query(Notification)
+    if user:
+        notification_query = notification_query.filter(Notification.user_id == user.id)
+    active_status_by_item_id = {item.id: item.status for item in item_query.all()}
     notification_statuses = {
         NotificationTypeEnum.EXPIRING_SOON: StatusEnum.EXPIRING_SOON,
         NotificationTypeEnum.EXPIRED: StatusEnum.EXPIRED,
     }
-    notifications = db.query(Notification).filter(
+    notifications = notification_query.filter(
         Notification.notification_type.in_(notification_statuses.keys())
     ).all()
 
@@ -175,10 +270,10 @@ def prune_non_expiring_notifications(db: Session) -> bool:
     return bool(stale_notifications)
 
 
-def sync_item_statuses_and_notifications(db: Session) -> None:
+def sync_item_statuses_and_notifications(db: Session, user: User) -> None:
     """Refresh item statuses and generate expiry notifications."""
     changed = False
-    items = db.query(FoodItem).all()
+    items = user_item_query(db, user).all()
 
     for item in items:
         status = calculate_status(item.expiry_date)
@@ -192,7 +287,7 @@ def sync_item_statuses_and_notifications(db: Session) -> None:
             ensure_status_notification(db, item, status)
             changed = changed or len(db.new) > before_new
 
-    changed = prune_non_expiring_notifications(db) or changed
+    changed = prune_non_expiring_notifications(db, user) or changed
 
     if changed:
         db.commit()
@@ -502,6 +597,44 @@ def ocr_label_image(image_bytes: bytes) -> Dict:
     }
 
 
+def _is_valid_gtin(barcode: str) -> bool:
+    """Validate the check digit used by EAN, UPC, and other GTIN codes."""
+    if not re.fullmatch(r"\d{8}|\d{12,14}", barcode):
+        return False
+
+    payload = barcode[:-1]
+    weighted_sum = sum(
+        int(digit) * (3 if index % 2 == 0 else 1)
+        for index, digit in enumerate(reversed(payload))
+    )
+    return (weighted_sum + int(barcode[-1])) % 10 == 0
+
+
+def extract_barcode_from_ocr(image_bytes: bytes) -> Dict:
+    """Read and validate a printed barcode number when visual decoding fails."""
+    _, _, pytesseract = _load_ocr_dependencies()
+    image_variants = preprocess_ocr_image(image_bytes)
+    candidates = []
+
+    for variant in image_variants:
+        for psm in (6, 7, 11, 12):
+            text = pytesseract.image_to_string(
+                variant,
+                config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+            )
+            for match in re.finditer(r"(?:\d[\s-]*){8,14}", text):
+                candidate = re.sub(r"\D", "", match.group(0))
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+    valid_barcode = next((code for code in candidates if _is_valid_gtin(code)), None)
+    return {
+        "found": valid_barcode is not None,
+        "barcode": valid_barcode,
+        "candidates": candidates[:10],
+    }
+
+
 def map_product_category(product: Dict) -> str:
     """Map product metadata into the app's category list."""
     category_text = " ".join([
@@ -559,9 +692,9 @@ def build_product_payload(barcode: str, product: Dict) -> Dict:
     }
 
 
-def get_used_space(db: Session, exclude_item_id: Optional[int] = None) -> int:
+def get_used_space(db: Session, user: User, exclude_item_id: Optional[int] = None) -> int:
     """Calculate fridge space used by stored items."""
-    query = db.query(FoodItem)
+    query = user_item_query(db, user)
     if exclude_item_id is not None:
         query = query.filter(FoodItem.id != exclude_item_id)
 
@@ -570,6 +703,7 @@ def get_used_space(db: Session, exclude_item_id: Optional[int] = None) -> int:
 
 def get_shelf_used_space(
     db: Session,
+    user: User,
     shelf_location: Optional[str],
     exclude_item_id: Optional[int] = None
 ) -> int:
@@ -577,7 +711,7 @@ def get_shelf_used_space(
     if not shelf_location:
         return 0
 
-    query = db.query(FoodItem).filter(FoodItem.shelf_location == shelf_location)
+    query = user_item_query(db, user).filter(FoodItem.shelf_location == shelf_location)
     if exclude_item_id is not None:
         query = query.filter(FoodItem.id != exclude_item_id)
 
@@ -586,14 +720,15 @@ def get_shelf_used_space(
 
 def ensure_fridge_space(
     db: Session,
+    user: User,
     requested_space: Optional[int],
     shelf_location: Optional[str] = None,
     exclude_item_id: Optional[int] = None
 ) -> None:
     """Reject create/update requests that exceed fridge or shelf capacity."""
     space_units = requested_space or 1
-    used_space = get_used_space(db, exclude_item_id=exclude_item_id)
-    empty_space = FRIDGE_CAPACITY_UNITS - used_space
+    used_space = get_used_space(db, user, exclude_item_id=exclude_item_id)
+    empty_space = user.fridge_capacity - used_space
 
     if space_units > empty_space:
         unit_label = "unit" if empty_space == 1 else "units"
@@ -609,6 +744,7 @@ def ensure_fridge_space(
         shelf_capacity = SHELF_CAPACITY_UNITS[shelf_location]
         shelf_used = get_shelf_used_space(
             db,
+            user,
             shelf_location,
             exclude_item_id=exclude_item_id
         )
@@ -662,6 +798,7 @@ def log_item_outcome(db: Session, item: FoodItem, outcome: str) -> None:
     }
 
     db.add(ActivityLog(
+        user_id=item.user_id,
         action=outcome.upper(),
         item_id=item.id,
         details=json.dumps(details)
@@ -690,9 +827,10 @@ def parse_outcome_details(log: ActivityLog) -> Optional[Dict]:
     return details
 
 
-def build_pattern_insights(db: Session) -> Dict:
+def build_pattern_insights(db: Session, user: User) -> Dict:
     """Build learned consumption and waste suggestions."""
     logs = db.query(ActivityLog).filter(
+        ActivityLog.user_id == user.id,
         ActivityLog.action.in_(["CONSUMED", "WASTED"])
     ).order_by(desc(ActivityLog.created_at)).all()
 
@@ -775,15 +913,73 @@ async def root():
     }
 
 
+@app.post("/api/auth/register", response_model=schemas.AuthResponse)
+async def register_user(payload: schemas.AuthRegister, db: Session = Depends(get_db)):
+    """Create an account with an individual fridge capacity."""
+    email = payload.email.strip().lower()
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    user = User(
+        email=email,
+        password_hash=hash_password(payload.password),
+        fridge_capacity=payload.fridge_capacity,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    claim_legacy_data(db, user)
+    db.commit()
+    return schemas.AuthResponse(
+        access_token=create_access_token(user.id), token_type="bearer", user=user
+    )
+
+
+@app.post("/api/auth/login", response_model=schemas.AuthResponse)
+async def login_user(payload: schemas.AuthLogin, db: Session = Depends(get_db)):
+    """Authenticate an existing account."""
+    user = db.query(User).filter(User.email == payload.email.strip().lower()).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return schemas.AuthResponse(
+        access_token=create_access_token(user.id), token_type="bearer", user=user
+    )
+
+
+@app.get("/api/auth/me", response_model=schemas.UserResponse)
+async def get_profile(user: User = Depends(get_current_user)):
+    """Return the current user's profile."""
+    return user
+
+
+@app.put("/api/settings/fridge", response_model=schemas.UserResponse)
+async def update_fridge_settings(
+    settings: schemas.FridgeSettings,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Update the current user's fridge capacity."""
+    used_space = get_used_space(db, user)
+    if settings.fridge_capacity < used_space:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Capacity cannot be lower than current usage of {used_space} units",
+        )
+    user.fridge_capacity = settings.fridge_capacity
+    db.commit()
+    db.refresh(user)
+    return user
+
+
 @app.post("/api/food-items", response_model=schemas.FoodItemResponse)
 async def create_food_item(
     item: schemas.FoodItemCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Create a new food item."""
     # Check for duplicate barcode
     if item.barcode:
-        existing = db.query(FoodItem).filter(
+        existing = user_item_query(db, user).filter(
             FoodItem.barcode == item.barcode
         ).first()
         if existing:
@@ -794,10 +990,11 @@ async def create_food_item(
 
     # Calculate initial status
     status = calculate_status(item.expiry_date)
-    ensure_fridge_space(db, item.space_units, item.shelf_location)
+    ensure_fridge_space(db, user, item.space_units, item.shelf_location)
 
     # Create food item
     db_item = FoodItem(
+        user_id=user.id,
         item_name=item.item_name,
         category=item.category,
         barcode=item.barcode,
@@ -819,6 +1016,7 @@ async def create_food_item(
 
     # Log activity
     log = ActivityLog(
+        user_id=user.id,
         action="CREATE",
         item_id=db_item.id,
         details=f"Created food item: {item.item_name}"
@@ -836,12 +1034,13 @@ async def list_food_items(
     sort_by: Optional[str] = "expiry_date",
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """List all food items with filtering and sorting."""
-    sync_item_statuses_and_notifications(db)
+    sync_item_statuses_and_notifications(db, user)
 
-    query = db.query(FoodItem)
+    query = user_item_query(db, user)
 
     if category:
         query = query.filter(FoodItem.category == category)
@@ -868,11 +1067,11 @@ async def list_food_items(
 
 
 @app.get("/api/food-items/{item_id}", response_model=schemas.FoodItemResponse)
-async def get_food_item(item_id: int, db: Session = Depends(get_db)):
+async def get_food_item(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Get a specific food item."""
-    sync_item_statuses_and_notifications(db)
+    sync_item_statuses_and_notifications(db, user)
 
-    item = db.query(FoodItem).filter(
+    item = user_item_query(db, user).filter(
         FoodItem.id == item_id
     ).first()
 
@@ -886,10 +1085,11 @@ async def get_food_item(item_id: int, db: Session = Depends(get_db)):
 async def update_food_item(
     item_id: int,
     item_update: schemas.FoodItemUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Update a food item."""
-    db_item = db.query(FoodItem).filter(
+    db_item = user_item_query(db, user).filter(
         FoodItem.id == item_id
     ).first()
 
@@ -898,7 +1098,7 @@ async def update_food_item(
 
     # Check for duplicate barcode
     if item_update.barcode and item_update.barcode != db_item.barcode:
-        existing = db.query(FoodItem).filter(
+        existing = user_item_query(db, user).filter(
             FoodItem.barcode == item_update.barcode
         ).first()
         if existing:
@@ -913,6 +1113,7 @@ async def update_food_item(
     requested_shelf = update_data.get("shelf_location", db_item.shelf_location)
     ensure_fridge_space(
         db,
+        user,
         requested_space,
         requested_shelf,
         exclude_item_id=item_id
@@ -930,10 +1131,11 @@ async def update_food_item(
     db.refresh(db_item)
 
     ensure_status_notification(db, db_item, db_item.status)
-    prune_non_expiring_notifications(db)
+    prune_non_expiring_notifications(db, user)
 
     # Log activity
     log = ActivityLog(
+        user_id=user.id,
         action="UPDATE",
         item_id=db_item.id,
         details=f"Updated food item: {db_item.item_name}"
@@ -945,9 +1147,9 @@ async def update_food_item(
 
 
 @app.delete("/api/food-items/{item_id}")
-async def delete_food_item(item_id: int, db: Session = Depends(get_db)):
+async def delete_food_item(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Delete a food item."""
-    db_item = db.query(FoodItem).filter(
+    db_item = user_item_query(db, user).filter(
         FoodItem.id == item_id
     ).first()
 
@@ -961,6 +1163,7 @@ async def delete_food_item(item_id: int, db: Session = Depends(get_db)):
 
     # Log activity
     log = ActivityLog(
+        user_id=user.id,
         action="DELETE",
         item_id=item_id,
         details=f"Deleted food item: {item_name}"
@@ -972,9 +1175,9 @@ async def delete_food_item(item_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/food-items/{item_id}/consume")
-async def mark_food_item_consumed(item_id: int, db: Session = Depends(get_db)):
+async def mark_food_item_consumed(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Mark an item as used so Frise can learn consumption patterns."""
-    db_item = db.query(FoodItem).filter(FoodItem.id == item_id).first()
+    db_item = user_item_query(db, user).filter(FoodItem.id == item_id).first()
 
     if not db_item:
         raise HTTPException(status_code=404, detail="Food item not found")
@@ -987,9 +1190,9 @@ async def mark_food_item_consumed(item_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/food-items/{item_id}/waste")
-async def mark_food_item_wasted(item_id: int, db: Session = Depends(get_db)):
+async def mark_food_item_wasted(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Mark an item as wasted so Frise can learn waste patterns."""
-    db_item = db.query(FoodItem).filter(FoodItem.id == item_id).first()
+    db_item = user_item_query(db, user).filter(FoodItem.id == item_id).first()
 
     if not db_item:
         raise HTTPException(status_code=404, detail="Food item not found")
@@ -1007,10 +1210,11 @@ async def mark_food_item_wasted(item_id: int, db: Session = Depends(get_db)):
 async def upload_image(
     item_id: int,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Upload an image for a food item."""
-    db_item = db.query(FoodItem).filter(
+    db_item = user_item_query(db, user).filter(
         FoodItem.id == item_id
     ).first()
 
@@ -1062,18 +1266,40 @@ async def extract_expiry_date(
     return result
 
 
+@app.post("/api/ocr/barcode")
+async def extract_barcode_number(
+    file: UploadFile = File(...),
+):
+    """Read the digits printed below a barcode as a fallback scanner."""
+    allowed_types = [
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/jpg",
+    ]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image upload")
+
+    return extract_barcode_from_ocr(image_bytes)
+
+
 # ==================== Search Endpoint ====================
 
 @app.get("/api/search")
 async def search_items(
     query: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Search food items by name or barcode."""
     if len(query) < 2:
         raise HTTPException(status_code=400, detail="Query too short")
 
-    items = db.query(FoodItem).filter(
+    items = user_item_query(db, user).filter(
         (FoodItem.item_name.ilike(f"%{query}%")) |
         (FoodItem.barcode == query)
     ).limit(10).all()
@@ -1141,18 +1367,22 @@ async def lookup_barcode(barcode: str):
 # ==================== Dashboard Endpoints ====================
 
 @app.get("/api/dashboard/stats", response_model=schemas.DashboardStats)
-async def get_dashboard_stats(db: Session = Depends(get_db)):
+async def get_dashboard_stats(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     """Get dashboard statistics."""
-    sync_item_statuses_and_notifications(db)
+    sync_item_statuses_and_notifications(db, user)
 
-    total_items = db.query(FoodItem).count()
-    fresh_items = db.query(FoodItem).filter(
+    item_query = user_item_query(db, user)
+    total_items = item_query.count()
+    fresh_items = item_query.filter(
         FoodItem.status == StatusEnum.FRESH
     ).count()
-    expiring_soon_items = db.query(FoodItem).filter(
+    expiring_soon_items = item_query.filter(
         FoodItem.status == StatusEnum.EXPIRING_SOON
     ).count()
-    expired_items = db.query(FoodItem).filter(
+    expired_items = item_query.filter(
         FoodItem.status == StatusEnum.EXPIRED
     ).count()
 
@@ -1160,14 +1390,15 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         NotificationTypeEnum.EXPIRING_SOON,
         NotificationTypeEnum.EXPIRED,
     ]
-    total_notifications = db.query(Notification).filter(
+    notification_query = db.query(Notification).filter(Notification.user_id == user.id)
+    total_notifications = notification_query.filter(
         Notification.notification_type.in_(expiry_notification_types)
     ).count()
-    unread_notifications = db.query(Notification).filter(
+    unread_notifications = notification_query.filter(
         Notification.notification_type.in_(expiry_notification_types),
         Notification.is_read.is_(False)
     ).count()
-    used_space = get_used_space(db)
+    used_space = get_used_space(db, user)
 
     return schemas.DashboardStats(
         total_items=total_items,
@@ -1176,9 +1407,9 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         expired_items=expired_items,
         total_notifications=total_notifications,
         unread_notifications=unread_notifications,
-        fridge_capacity=FRIDGE_CAPACITY_UNITS,
+        fridge_capacity=user.fridge_capacity,
         used_space=used_space,
-        empty_space=max(FRIDGE_CAPACITY_UNITS - used_space, 0)
+        empty_space=max(user.fridge_capacity - used_space, 0)
     )
 
 
@@ -1186,26 +1417,27 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     "/api/dashboard/categories",
     response_model=List[schemas.CategoryStats]
 )
-async def get_category_stats(db: Session = Depends(get_db)):
+async def get_category_stats(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Get statistics by category."""
-    sync_item_statuses_and_notifications(db)
+    sync_item_statuses_and_notifications(db, user)
 
-    categories = db.query(FoodItem.category).distinct().all()
+    item_query = user_item_query(db, user)
+    categories = item_query.with_entities(FoodItem.category).distinct().all()
 
     stats = []
     for (category,) in categories:
-        total = db.query(FoodItem).filter(
+        total = item_query.filter(
             FoodItem.category == category
         ).count()
-        fresh = db.query(FoodItem).filter(
+        fresh = item_query.filter(
             FoodItem.category == category,
             FoodItem.status == StatusEnum.FRESH
         ).count()
-        expiring_soon = db.query(FoodItem).filter(
+        expiring_soon = item_query.filter(
             FoodItem.category == category,
             FoodItem.status == StatusEnum.EXPIRING_SOON
         ).count()
-        expired = db.query(FoodItem).filter(
+        expired = item_query.filter(
             FoodItem.category == category,
             FoodItem.status == StatusEnum.EXPIRED
         ).count()
@@ -1222,9 +1454,9 @@ async def get_category_stats(db: Session = Depends(get_db)):
 
 
 @app.get("/api/dashboard/consumption-patterns")
-async def get_consumption_patterns(db: Session = Depends(get_db)):
+async def get_consumption_patterns(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Get learned food consumption and waste patterns."""
-    return build_pattern_insights(db)
+    return build_pattern_insights(db, user)
 
 
 # ==================== Notification Endpoints ====================
@@ -1237,12 +1469,14 @@ async def get_notifications(
     skip: int = 0,
     limit: int = 50,
     unread_only: bool = False,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Get notifications."""
-    sync_item_statuses_and_notifications(db)
+    sync_item_statuses_and_notifications(db, user)
 
     query = db.query(Notification).filter(
+        Notification.user_id == user.id,
         Notification.notification_type.in_([
             NotificationTypeEnum.EXPIRING_SOON,
             NotificationTypeEnum.EXPIRED,
@@ -1262,10 +1496,12 @@ async def get_notifications(
 @app.put("/api/notifications/{notification_id}/read")
 async def mark_notification_read(
     notification_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Mark notification as read."""
     notification = db.query(Notification).filter(
+        Notification.user_id == user.id,
         Notification.id == notification_id
     ).first()
 
@@ -1282,10 +1518,12 @@ async def mark_notification_read(
 @app.delete("/api/notifications/{notification_id}")
 async def delete_notification(
     notification_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Delete a notification."""
     notification = db.query(Notification).filter(
+        Notification.user_id == user.id,
         Notification.id == notification_id
     ).first()
 

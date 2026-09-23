@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
+import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import { FiCamera, FiLoader, FiSearch, FiX } from 'react-icons/fi';
 import { foodItemsAPI } from '../services/api';
 import '../styles/FoodModal.css';
@@ -15,6 +16,23 @@ const emptyFormData = {
   shelf_location: 'Top Shelf',
   space_units: 1
 };
+
+const barcodeDecodeHints = new Map([
+  [DecodeHintType.POSSIBLE_FORMATS, [
+    BarcodeFormat.EAN_13,
+    BarcodeFormat.EAN_8,
+    BarcodeFormat.UPC_A,
+    BarcodeFormat.UPC_E,
+    BarcodeFormat.CODE_128,
+    BarcodeFormat.CODE_39,
+    BarcodeFormat.ITF,
+  ]],
+  [DecodeHintType.TRY_HARDER, true],
+]);
+
+const createBarcodeReader = () => new BrowserMultiFormatReader(barcodeDecodeHints, {
+  delayBetweenScanAttempts: 100,
+});
 
 const shelfCapacityUnits = {
   'Top Shelf': 8,
@@ -149,6 +167,7 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
   const barcodeControlsRef = useRef(null);
   const barcodeStreamRef = useRef(null);
   const scanLockedRef = useRef(false);
+  const barcodeScanTimeoutRef = useRef(null);
   const barcodeLookupTimerRef = useRef(null);
   const ocrStreamRef = useRef(null);
   const ocrAutoCaptureRef = useRef(null);
@@ -214,6 +233,10 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
       window.clearTimeout(barcodeLookupTimerRef.current);
       barcodeLookupTimerRef.current = null;
     }
+    if (barcodeScanTimeoutRef.current) {
+      window.clearTimeout(barcodeScanTimeoutRef.current);
+      barcodeScanTimeoutRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -238,6 +261,10 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
     if (barcodeLookupTimerRef.current) {
       window.clearTimeout(barcodeLookupTimerRef.current);
       barcodeLookupTimerRef.current = null;
+    }
+    if (barcodeScanTimeoutRef.current) {
+      window.clearTimeout(barcodeScanTimeoutRef.current);
+      barcodeScanTimeoutRef.current = null;
     }
 
     scanLockedRef.current = false;
@@ -388,10 +415,12 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
         return false;
       }
 
-      setFormData(prev => ({
-        ...prev,
+      const nextValue = {
+        ...formDataRef.current,
         expiry_date: toDateTimeLocalValue(parsedDate)
-      }));
+      };
+      formDataRef.current = nextValue;
+      setFormData(nextValue);
       setModeStatus(`Expiry date filled: ${parsedDate.toLocaleDateString()}`);
       stopOcrStream(true);
       return true;
@@ -406,6 +435,15 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
 
   const normalizeBarcode = (value) => value.replace(/\s/g, '').trim();
 
+  const setScannedBarcode = (barcode) => {
+    const nextValue = {
+      ...formDataRef.current,
+      barcode: normalizeBarcode(barcode)
+    };
+    formDataRef.current = nextValue;
+    setFormData(nextValue);
+    setErrors(prev => ({ ...prev, barcode: '' }));
+  };
 
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -503,6 +541,10 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
   };
 
   const stopBarcodeScan = () => {
+    if (barcodeScanTimeoutRef.current) {
+      window.clearTimeout(barcodeScanTimeoutRef.current);
+      barcodeScanTimeoutRef.current = null;
+    }
     if (barcodeControlsRef.current) {
       barcodeControlsRef.current.stop();
       barcodeControlsRef.current = null;
@@ -529,6 +571,71 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
     return targetRef.current;
   };
 
+  const readBarcodeNumberWithOcr = async () => {
+    const videoElement = videoRef.current;
+    if (!videoElement?.videoWidth) return '';
+
+    const canvas = document.createElement('canvas');
+    canvas.width = videoElement.videoWidth;
+    canvas.height = videoElement.videoHeight;
+    const context = canvas.getContext('2d');
+    context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+    const imageBlob = await new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error('Could not create barcode snapshot'));
+      }, 'image/jpeg', 0.95);
+    });
+
+    const response = await foodItemsAPI.scanBarcodeNumber(
+      new File([imageBlob], 'barcode.jpg', { type: 'image/jpeg' })
+    );
+    return normalizeBarcode(response?.data?.barcode || '');
+  };
+
+  const captureBarcodeFrame = async () => {
+    const videoElement = videoRef.current;
+    const stream = barcodeStreamRef.current;
+    if (!videoElement || !videoElement.videoWidth || !stream) {
+      setBarcodeStatus('Camera not ready. Wait a moment and try Capture again.');
+      return;
+    }
+
+    if (barcodeControlsRef.current) {
+      setBarcodeStatus('Scanning automatically... Keep the barcode centered.');
+      return;
+    }
+
+    setBarcodeStatus('Scanning automatically... Keep the barcode centered.');
+    scanLockedRef.current = false;
+
+    try {
+      barcodeReaderRef.current = createBarcodeReader();
+      barcodeControlsRef.current = await barcodeReaderRef.current.decodeFromVideoElement(
+        videoElement,
+        (result) => {
+          if (!result || scanLockedRef.current) return;
+
+          scanLockedRef.current = true;
+          const scannedBarcode = normalizeBarcode(result.getText());
+          if (!scannedBarcode) {
+            scanLockedRef.current = false;
+            return;
+          }
+
+          setScannedBarcode(scannedBarcode);
+          setBarcodeStatus(`Barcode captured: ${scannedBarcode}. Fetching product details...`);
+          stopBarcodeScan();
+          void handleBarcodeLookup(scannedBarcode);
+        }
+      );
+    } catch (error) {
+      console.error('Barcode capture error', error);
+      setBarcodeStatus('Could not start barcode reading. Reposition the barcode and try Capture again.');
+    }
+  };
+
   const startBarcodeScan = async () => {
     if (isScanningBarcode) {
       stopBarcodeScan();
@@ -546,10 +653,6 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
     scanLockedRef.current = false;
 
     try {
-      if (!barcodeReaderRef.current) {
-        barcodeReaderRef.current = new BrowserMultiFormatReader();
-      }
-
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: 'environment',
@@ -569,26 +672,32 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
       videoElement.muted = true;
       await videoElement.play();
 
-      setBarcodeStatus('Camera active. Hold barcode in front of the camera.');
-
-      barcodeControlsRef.current = await barcodeReaderRef.current.decodeFromStream(
-        stream,
-        videoElement,
-        (result, error) => {
-          if (error) {
-            console.debug('Barcode scan callback error', error);
-            return;
-          }
-          if (!result || scanLockedRef.current) return;
-
+      setBarcodeStatus('Scanning automatically... Hold the barcode steady and in focus.');
+      barcodeScanTimeoutRef.current = window.setTimeout(() => {
+        if (!scanLockedRef.current) {
           scanLockedRef.current = true;
-          const scannedBarcode = normalizeBarcode(result.getText());
-          setFormData(prev => ({ ...prev, barcode: scannedBarcode }));
-          setBarcodeStatus('Barcode scanned. Fetching product details...');
-          stopBarcodeScan();
-          void handleBarcodeLookup(scannedBarcode);
+          setBarcodeStatus('Barcode pattern was not detected. Reading the printed number...');
+          void readBarcodeNumberWithOcr()
+            .then((scannedBarcode) => {
+              if (!scannedBarcode) {
+                setBarcodeStatus('Could not scan a barcode. Move closer, improve lighting, and try again.');
+                stopBarcodeScan();
+                return;
+              }
+
+              setScannedBarcode(scannedBarcode);
+              setBarcodeStatus(`Barcode number read: ${scannedBarcode}. Fetching product details...`);
+              stopBarcodeScan();
+              void handleBarcodeLookup(scannedBarcode);
+            })
+            .catch((error) => {
+              console.error('Barcode OCR fallback failed', error);
+              setBarcodeStatus('Could not read the barcode number. Move closer, improve lighting, and try again.');
+              stopBarcodeScan();
+            });
         }
-      );
+      }, 15000);
+      await captureBarcodeFrame();
     } catch (error) {
       console.error('Barcode scan error', error);
       const message = error.name === 'NotAllowedError'
@@ -700,7 +809,7 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
 
             <div className="form-row">
               <div className="form-group">
-                <label>Barcode scan</label>
+                <label>Barcode number</label>
                 <div className="input-with-actions">
                   <input
                     type="text"
@@ -708,7 +817,7 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
                     value={formData.barcode}
                     onChange={handleChange}
                     onKeyDown={handleBarcodeKeyDown}
-                    placeholder="Enter barcode or scan below"
+                    placeholder="Enter a barcode number or scan it"
                     inputMode="numeric"
                     autoComplete="off"
                     className={errors.barcode ? 'input-error' : ''}
@@ -725,14 +834,23 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
                 </div>
                 <button
                   type="button"
-                  className="btn btn-secondary barcode-scan-btn"
+                  className="scan-action-card barcode-scan-btn"
                   onClick={startBarcodeScan}
-                  disabled={isScanningBarcode}
                   title={isScanningBarcode ? 'Stop scanning' : 'Scan barcode'}
                 >
-                  {isScanningBarcode ? 'Stop barcode scan' : 'Scan barcode'}
+                  <span className="scan-action-icon">
+                    {isScanningBarcode ? <FiLoader size={18} /> : <FiCamera size={18} />}
+                  </span>
+                  <span className="scan-action-content">
+                    <span className="scan-action-title">
+                      {isScanningBarcode ? 'Stop barcode scan' : 'Scan barcode number'}
+                    </span>
+                    <span className="scan-action-copy">
+                      Point the camera at the barcode. The number is detected automatically.
+                    </span>
+                  </span>
                 </button>
-                <span className="helper-text">Enter or scan the barcode to fetch product details.</span>
+                <span className="helper-text">The barcode number is filled directly, then product details are looked up.</span>
                 {errors.barcode && <span className="error-text">{errors.barcode}</span>}
                 {barcodeStatus && <span className="helper-text">{barcodeStatus}</span>}
               </div>
@@ -764,9 +882,15 @@ const FoodModal = ({ isOpen, onClose, onSubmit, initialData }) => {
                 {isScanningBarcode && (
                   <>
                     <video ref={videoRef} className="scanner-video" muted playsInline />
-                    <button type="button" className="btn btn-secondary" onClick={stopBarcodeScan}>
-                      Stop Barcode Scanner
-                    </button>
+                    <div className="scanner-actions">
+                      <button type="button" className="btn btn-primary" onClick={captureBarcodeFrame}>
+                        Scan now
+                      </button>
+                      <button type="button" className="btn btn-secondary" onClick={stopBarcodeScan}>
+                        Stop Scan
+                      </button>
+                    </div>
+                    <span className="helper-text">{barcodeStatus}</span>
                   </>
                 )}
                 {isOcrScanning && (
